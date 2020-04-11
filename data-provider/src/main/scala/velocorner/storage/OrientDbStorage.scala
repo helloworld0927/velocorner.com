@@ -4,6 +4,7 @@ import com.orientechnologies.orient.core.command.OCommandResultListener
 import com.orientechnologies.orient.core.db.{ODatabaseType, OrientDB, OrientDBConfig}
 import com.orientechnologies.orient.core.db.document.ODatabaseDocument
 import com.orientechnologies.orient.core.metadata.schema.{OClass, OType}
+import com.orientechnologies.orient.core.record.ORecord
 import com.orientechnologies.orient.core.record.impl.ODocument
 import com.orientechnologies.orient.core.sql.query.OSQLNonBlockingQuery
 import play.api.libs.json.{Format, Json, Reads, Writes}
@@ -21,6 +22,7 @@ import scala.concurrent.ExecutionContext.Implicits.global
 import com.typesafe.scalalogging.LazyLogging
 import scalaz._
 import scalaz.std.list._
+import scalaz.syntax.functor._
 import scalaz.syntax.std.option._
 import scalaz.syntax.std.boolean._
 import scalaz.std.scalaFuture._
@@ -31,15 +33,21 @@ import velocorner.api.weather.{SunriseSunset, WeatherForecast}
 import scala.jdk.CollectionConverters._
 
 /**
- * Created by levi on 14.11.16.
- */
-class OrientDbStorage(dbUrl: Option[String], dbPassword: String)
+  * Created by levi on 14.11.16.
+  * Improvements to do:
+  * - use new query API from OrientDB 3.0
+  * - use monad stack M[_] : Monad
+  * - use parametrized query
+  * - use fetch strategy, don't retrieve all the document versions
+  * - use compound index for athlete.id and activity type
+  */
+class OrientDbStorage(url: Option[String], dbPassword: String)
   extends Storage[Future] with CloseableResource with Metrics with LazyLogging {
 
   @volatile var server: Option[OrientDB] = None
-  private val dbUser = dbUrl.isDefined ? "root" | "admin"
-  private val orientDbUrl = dbUrl.map("remote:" + _).getOrElse("memory:")
-  private val dbType = dbUrl.isDefined ? ODatabaseType.PLOCAL | ODatabaseType.MEMORY
+  private val dbUser = url.isDefined ? "root" | "admin"
+  private val dbUrl = url.map("remote:" + _).getOrElse("memory:")
+  private val dbType = url.isDefined ? ODatabaseType.PLOCAL | ODatabaseType.MEMORY
 
   private def lookup[T](className: String, propertyName: String, propertyValue: Long)(implicit fjs: Reads[T]): Future[Option[T]] = {
     val sql = s"SELECT FROM $className WHERE $propertyName = $propertyValue"
@@ -62,16 +70,18 @@ class OrientDbStorage(dbUrl: Option[String], dbPassword: String)
     activities
       .toList
       .traverseU(a => upsert(a, ACTIVITY_CLASS, s"SELECT FROM $ACTIVITY_CLASS WHERE id = ${a.id}"))
-      .map(_ => ())
+      .void
   }
 
-  override def listActivityTypes(athleteId: Long): Future[Iterable[String]] = Future { inTx { db =>
-    val results = db.query(s"SELECT type AS name, COUNT(*) AS counter FROM $ACTIVITY_CLASS WHERE athlete.id = $athleteId GROUP BY name ORDER BY counter DESC")
-    results.asScala.map(d => JsonIo.read[Counter](d.toJSON)).map(_.name).to(Iterable)
-  }}
+  override def listActivityTypes(athleteId: Long): Future[Iterable[String]] = Future {
+    transact { db =>
+      val results = db.query(s"SELECT type AS name, COUNT(*) AS counter FROM $ACTIVITY_CLASS WHERE athlete.id = $athleteId GROUP BY name ORDER BY counter DESC")
+      results.asScala.map(d => JsonIo.read[Counter](d.toJSON)).map(_.name).to(Iterable)
+    }
+  }
 
   override def listAllActivities(athleteId: Long, activityType: String): Future[Iterable[Activity]] =
-    queryFor[Activity](s"SELECT FROM $ACTIVITY_CLASS WHERE athlete.id = $athleteId AND type = '$activityType'")
+    queryFor[Activity](s"SELECT FROM $ACTIVITY_CLASS WHERE athlete.id = ? AND type = '$activityType'", athleteId)
 
   // to check how much needs to be imported from the feed
   override def listRecentActivities(athleteId: Long, limit: Int): Future[Iterable[Activity]] = {
@@ -106,16 +116,22 @@ class OrientDbStorage(dbUrl: Option[String], dbPassword: String)
     override def listRecentForecast(location: String, limit: Int): Future[Iterable[WeatherForecast]] = {
       queryFor[WeatherForecast](s"SELECT FROM $WEATHER_CLASS WHERE location like '$location' ORDER BY timestamp DESC LIMIT $limit")
     }
+
     override def storeWeather(forecast: Iterable[WeatherForecast]): Future[Unit] = {
-      forecast.toList.traverseU(a => upsert(a, WEATHER_CLASS, s"SELECT FROM $WEATHER_CLASS WHERE location like '${a.location}' AND timestamp = ${a.timestamp}"))
-        .map(_ => ())
+      forecast
+        .toList
+        .traverseU(a => upsert(a, WEATHER_CLASS, s"SELECT FROM $WEATHER_CLASS WHERE location like '${a.location}' AND timestamp = ${a.timestamp}"))
+        .void
     }
+
     override def getSunriseSunset(location: String, localDate: String): Future[Option[SunriseSunset]] =
       queryForOption[SunriseSunset](s"SELECT FROM $SUN_CLASS WHERE location like '$location' AND date = '$localDate'")
+
     override def storeSunriseSunset(sunriseSunset: SunriseSunset): Future[Unit] = {
       upsert(sunriseSunset, SUN_CLASS, s"SELECT FROM $SUN_CLASS WHERE location like '${sunriseSunset.location}' AND date = '${sunriseSunset.date}'")
     }
   }
+
   override def getWeatherStorage: WeatherStorage = weatherStorage
 
   // attributes
@@ -124,11 +140,13 @@ class OrientDbStorage(dbUrl: Option[String], dbPassword: String)
       val attr = KeyValue(key, `type`, value)
       upsert(attr, ATTRIBUTE_CLASS, s"SELECT FROM $ATTRIBUTE_CLASS WHERE type = '${`type`}' and key = '$key'")
     }
+
     override def getAttribute(key: String, `type`: String): Future[Option[String]] = {
       queryForOption[KeyValue](s"SELECT FROM $ATTRIBUTE_CLASS WHERE type = '${`type`}' AND key = '$key'")
         .map(_.map(_.value))
     }
   }
+
   override def getAttributeStorage: AttributeStorage = attributeStorage
 
   // various achievements
@@ -137,11 +155,13 @@ class OrientDbStorage(dbUrl: Option[String], dbPassword: String)
     object ResDoubleRow {
       implicit val doubleRowFormat = Format[ResDoubleRow](Json.reads[ResDoubleRow], Json.writes[ResDoubleRow])
     }
+
     case class ResDoubleRow(res_value: Double)
 
     object ResLongRow {
       implicit val longRowFormat = Format[ResLongRow](Json.reads[ResLongRow], Json.writes[ResLongRow])
     }
+
     case class ResLongRow(res_value: Long)
 
     private def minOf(athleteId: Long, activityType: String, fieldName: String, mapperFunc: Activity => Option[Double], tolerance: Double = .1d): Future[Option[Achievement]] = {
@@ -179,23 +199,31 @@ class OrientDbStorage(dbUrl: Option[String], dbPassword: String)
     }
 
     override def maxAverageSpeed(athleteId: Long, activity: String): Future[Option[Achievement]] = maxOf(athleteId, activity, "average_speed", _.average_speed.map(_.toDouble))
+
     override def maxDistance(athleteId: Long, activity: String): Future[Option[Achievement]] = maxOf(athleteId, activity, "distance", _.distance.toDouble.some)
+
     override def maxElevation(athleteId: Long, activity: String): Future[Option[Achievement]] = maxOf(athleteId, activity, "total_elevation_gain", _.total_elevation_gain.toDouble.some)
+
     override def maxHeartRate(athleteId: Long, activity: String): Future[Option[Achievement]] = maxOf(athleteId, activity, "max_heartrate", _.max_heartrate.map(_.toDouble))
+
     override def maxAverageHeartRate(athleteId: Long, activity: String): Future[Option[Achievement]] = maxOf(athleteId, activity, "average_heartrate", _.average_heartrate.map(_.toDouble))
+
     override def maxAveragePower(athleteId: Long, activity: String): Future[Option[Achievement]] = maxOf(athleteId, activity, "average_watts", _.average_watts.map(_.toDouble))
+
     override def minAverageTemperature(athleteId: Long, activity: String): Future[Option[Achievement]] = minOf(athleteId, activity, "average_temp", _.average_temp.map(_.toDouble))
+
     override def maxAverageTemperature(athleteId: Long, activity: String): Future[Option[Achievement]] = maxOf(athleteId, activity, "average_temp", _.average_temp.map(_.toDouble))
   }
+
   override def getAchievementStorage: AchievementStorage = achievementStorage
 
   // initializes any connections, pools, resources needed to open a storage session
   override def initialize(): Unit = {
-    val orientDb: OrientDB = new OrientDB(orientDbUrl, dbUser, dbPassword, OrientDBConfig.defaultConfig())
+    val orientDb: OrientDB = new OrientDB(dbUrl, dbUser, dbPassword, OrientDBConfig.defaultConfig())
     orientDb.createIfNotExists(DATABASE_NAME, dbType)
     server = orientDb.some
 
-    inTx { odb =>
+    transact { odb =>
       case class IndexSetup(indexField: String, indexType: OType)
 
       def createIxIfNeeded(className: String, indexType: OClass.INDEX_TYPE, index: IndexSetup*): Unit = {
@@ -210,14 +238,14 @@ class OrientDbStorage(dbUrl: Option[String], dbPassword: String)
         val ixFields = index.map(_.indexField).sorted
         val ixName = ixFields.mkString("-").replace(".", "_")
 
-        if (!clazz.areIndexed(ixFields:_*)) clazz.createIndex(s"$ixName-$className", indexType, ixFields:_*)
+        if (!clazz.areIndexed(ixFields: _*)) clazz.createIndex(s"$ixName-$className", indexType, ixFields: _*)
       }
 
       def dropIx(className: String, ixName: String): Unit = {
         val ixManager = odb.getMetadata.getIndexManager
         // old name was without hyphen, try both versions
         val names = Seq(s"$ixName$className", s"$ixName-$className")
-        names.foreach{n =>
+        names.foreach { n =>
           if (ixManager.existsIndex(n)) ixManager.dropIndex(n)
         }
         val schema = odb.getMetadata.getSchema
@@ -244,7 +272,7 @@ class OrientDbStorage(dbUrl: Option[String], dbPassword: String)
     logger.info("database has been closed...")
   }
 
-  def inTx[T](body: ODatabaseDocument => T): T = {
+  def transact[T](body: ODatabaseDocument => T): T = {
     server.map { orientDb =>
       val session = orientDb.open(DATABASE_NAME, dbUser, dbPassword)
       session.activateOnCurrentThread()
@@ -256,57 +284,65 @@ class OrientDbStorage(dbUrl: Option[String], dbPassword: String)
     }.getOrElse(throw new IllegalStateException("database is closed"))
   }
 
-  // asynch
-  private def queryFor[T](sql: String)(implicit fjs: Reads[T]): Future[Seq[T]] = inTx { db =>
-    Try {
-      val promise = Promise[Seq[T]]()
-      db.query(new OSQLNonBlockingQuery[ODocument](sql, new OCommandResultListener() {
-        val accuResults = new ListBuffer[T]
-
-        override def result(iRecord: Any): Boolean = {
-          val doc = iRecord.asInstanceOf[ODocument]
-          accuResults += JsonIo.read[T](doc.toJSON)
-          true
-        }
-
-        override def end(): Unit = {
-          // might be called twice in case of failure
-          if (!promise.isCompleted) {
-            promise.success(accuResults.toSeq)
-          }
-        }
-
-        override def getResult: AnyRef = accuResults
-      }))
-      promise.future
-    }.fold(err => Future.failed(err), res => res)
+  private def queryFor[T](sql: String, args: Any*)(implicit fjs: Reads[T]): Future[Seq[T]] = Future {
+    transact { db =>
+      val results = db.query(sql, args.asJava)
+      val accuResults = new ListBuffer[T]
+      while (results.hasNext) {
+        val or = results.next()
+        val json = or.toJSON
+        accuResults += JsonIo.read[T](json)
+      }
+      results.close()
+      accuResults.toSeq
+    }
   }
 
   private def queryForOption[T](sql: String)(implicit fjs: Reads[T]): Future[Option[T]] = queryFor(sql).map(_.headOption)
 
-  private def upsert[T](payload: T, className: String, sql: String)(implicit fjs: Writes[T]): Future[Unit] = inTx { db =>
-    Try {
-      val promise = Promise[Unit]()
-      db.query(new OSQLNonBlockingQuery[ODocument](sql, new OCommandResultListener() {
-        val accuResults = new ListBuffer[ODocument]
-
-        override def result(iRecord: Any): Boolean = {
-          val doc = iRecord.asInstanceOf[ODocument]
-          accuResults += doc
-          false
+  private def upsert[T](payload: T, className: String, sql: String)(implicit fjs: Writes[T]): Future[Unit] = Future {
+    val json = JsonIo.write(payload)
+    val isUpdate = transact { db =>
+      val results = db.query(sql)
+      val isUpdate = results.hasNext
+      if (isUpdate) {
+        val a = results.next()
+        //results.close()
+        //val el = a.toElement
+        //el.fromJSON(JsonIo.write(payload))
+        a.getRecord.map { r =>
+          val rid = r.getIdentity
+          val doc: ODocument = db.load(rid)
+          doc.merge(new ODocument(json).setTrackingChanges(false), false, false)
+          if (doc.isDirty) doc.save()
+          ()
         }
+        //el
+      } else {
+//        val doc = new ODocument(className)
+//        doc.fromJSON(json).save()
+        //results.close()
+        //val doc = new ODocument(className)
+        //doc.fromJSON(json).save()
+//        val el = db.newElement(className)
+//        el.fromJSON(json)
+//        el.save()
+        //val record: ORecord = el.fromJSON(json)
+//        record.map { r =>
+//          r.save()
+//          ()
+//        }
+        ()
+      }
+      //element.fromJSON(JsonIo.write(payload))
+      //element.save()
+      isUpdate
+    }
 
-        override def end(): Unit = {
-          val doc = accuResults.headOption.getOrElse(new ODocument(className))
-          doc.fromJSON(JsonIo.write(payload))
-          doc.save()
-          promise.success(())
-        }
-
-        override def getResult: AnyRef = null
-      }))
-      promise.future
-    }.fold(err => Future.failed(err), res => res)
+    if (!isUpdate) transact {_ =>
+      val doc = new ODocument(className)
+      doc.fromJSON(json).save()
+    }
   }
 }
 
