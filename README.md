@@ -11,7 +11,7 @@
 ![Build Stats](https://buildstats.info/travisci/chart/peregin/velocorner.com?branch=master&buildCount=25)
 
 # velocorner.com
-The web application provides metrics for cycling and running (or for other kind of sports) activities.
+The web application provides metrics for cycling and running (or other kind of sports) activities.
 The statistics page compares yearly aggregated data, such as distance, hours ridden, elevation gained and shows year to 
 date series as well.
 The yearly data is also presented as a heatmap, so it is easy to compare the efforts for a given period of the year.
